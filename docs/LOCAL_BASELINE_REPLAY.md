@@ -39,6 +39,30 @@ when a short test must exclude archive ingestion. Regional receiver bounds do
 not reduce the size of daily ADS-B archives. Preserve an unfinished `.building`
 file before any operation that could replace it.
 
+### Recover an index stopped during final compaction
+
+If a stopped builder committed its final segment and prepared-track metadata but
+did not publish a `.sqlite` file, `scripts/recover_flight_index.py` can compact it
+into a separate destination. It opens the source read-only and holds the same
+advisory lock as the builder. It refuses existing destinations/partial outputs,
+leaves the original `.building` unchanged, and preserves failed partial copies.
+Prefer a destination on WSL's Linux filesystem for SQLite performance:
+
+```bash
+python scripts/recover_flight_index.py \
+  --source /absolute/path/to/all-types-v2-NORMALIZER.building \
+  --destination /home/USER/doppler-data/recovered/all-types-v2-NORMALIZER.sqlite \
+  --max-runtime 600
+```
+
+Recovery checks the complete SQLite structure and spatial R-tree, compares
+segment/prepared counts with the committed metadata, and checks sampled raw and
+prepared payload hashes. Every queried payload remains subject to the runtime's
+own integrity checks. This does not prove ADS-B receiver completeness, recover an
+unfinished ingestion stage, or supply an absent UTC day. Flight-selection rules
+and source coverage are not changed. Only a copy passing validation is published;
+do not use a `.recovering` file as an index.
+
 A replay does not validate the advanced detector, establish flight identity,
 or turn a ranking into an accepted location. Bounds informed by a reference
 point make the experiment a known-area test. The package cannot infer how a
