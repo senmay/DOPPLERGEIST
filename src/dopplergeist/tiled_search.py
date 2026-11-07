@@ -187,6 +187,14 @@ def _tile_capacity_error(error):
     }
 
 
+def _association_capacity_error(error):
+    """Both enumeration and index construction can exhaust association work."""
+    return str(error) in {
+        "Association candidate budget exceeded; search is incomplete",
+        "Association work/storage budget exceeded; search is incomplete",
+    }
+
+
 @lru_cache(maxsize=8)
 def _cached_to_geographic(crs):
     return Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
@@ -1282,9 +1290,15 @@ def search_national(indexes, terrain, events, measurements, *, time_range_s, out
                 except (DataUnavailable, ValueError, OSError) as error:
                     if isinstance(error, TileFailure):
                         restore_terrain(error.provenance)
+                    if _tile_capacity_error(error):
+                        # Keep subdivision markers unchanged for existing resume
+                        # readers; store the lost failure reason separately.
+                        write_json(output / f"capacity-{tile_id}.json",
+                                   {"run_hash": run_hash, "stage": stage,
+                                    "cells": list(cells), "reason": str(error)})
                     parts = _split_tile_cells(cells) if _tile_capacity_error(error) else []
                     children = [[f"{tile_id}~{i}", list(part)] for i, part in enumerate(parts)]
-                    if not children and str(error) == "Association candidate budget exceeded; search is incomplete":
+                    if not children and _association_capacity_error(error):
                         children = _clock_children(tile_id, cells, start_window, parameters, filters, events)
                     if children:
                         terminal = False

@@ -159,10 +159,18 @@ capacity limit is still exceeded, the search divides the tile into smaller
 nonoverlapping grid rectangles and checkpoints each completed piece. Fine search
 also divides overloaded rectangles.
 If an unknown-clock, robust subset search still exceeds its association-count
-limit at one cell, it partitions first-passage clock anchors into checkpointed,
+or association work/storage limit at one cell, it partitions first-passage clock
+anchors into checkpointed,
 half-open ranges. Each candidate belongs to one range and retains its full fit
 interval. Other single-cell capacity failures, missing data, and errors remain
-visible as incomplete work. Reducing `tile_cells` trades scheduling overhead for
+visible as incomplete work. Coarse capacity failures also write a separate
+`capacity-TILE.json` with the exact reason; existing subdivision marker formats
+and resume validation stay unchanged. The work/storage path is checked by
+`tests/test_real_association_work_partition.py` against an actual recorded job,
+including replay of its clock-child checkpoint. It requires
+`DOPPLERGEIST_REAL_WORK_JOB` and `DOPPLERGEIST_REAL_WORK_CONFIG`; it is a bounded
+software check, not location-accuracy evidence.
+Reducing `tile_cells` trades scheduling overhead for
 smaller working sets.
 
 On one overloaded full-day cell from the original recording and historical
