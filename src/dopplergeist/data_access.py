@@ -593,8 +593,16 @@ def _build_flight_segments(flight, records, max_gap_s, namespace):
     return segments
 
 
-def _flight_inputs(db, max_flight_samples):
-    for (flight,) in db.execute("SELECT DISTINCT flight FROM samples ORDER BY flight"):
+_INDEX_CHECKPOINT_SECONDS = 5.0
+
+
+def _flight_inputs(db, max_flight_samples, after=None):
+    query = "SELECT DISTINCT flight FROM samples"
+    parameters = ()
+    if after is not None:
+        query += " WHERE flight>?"
+        parameters = (after,)
+    for (flight,) in db.execute(query + " ORDER BY flight", parameters):
         count = db.execute("SELECT count(*) FROM samples WHERE flight=?", (flight,)).fetchone()[0]
         if count > max_flight_samples:
             raise DataUnavailable(f"Flight {flight} exceeds {max_flight_samples} sample memory limit")
@@ -602,22 +610,22 @@ def _flight_inputs(db, max_flight_samples):
         yield flight, records
 
 
-def _parallel_flight_segments(db, max_flight_samples, max_gap_s, namespace, workers):
+def _parallel_flight_segments(db, max_flight_samples, max_gap_s, namespace, workers, after=None):
     # Keep source order and cap queued serialized inputs as well as task count.
     max_pending_bytes = 128 * 1024 * 1024
     with _index_pool(workers) as pool:
         pending, queued_bytes = deque(), 0
-        for flight, records in _flight_inputs(db, max_flight_samples):
+        for flight, records in _flight_inputs(db, max_flight_samples, after):
             size = sum(len(row.encode("utf-8")) for row in records)
             while pending and (len(pending) >= workers or queued_bytes + size > max_pending_bytes):
-                future, used = pending.popleft()
+                name, future, used = pending.popleft()
                 queued_bytes -= used
-                yield future.result()
-            pending.append((pool.submit(_build_flight_segments, flight, records, max_gap_s, namespace), size))
+                yield name, future.result()
+            pending.append((flight, pool.submit(_build_flight_segments, flight, records, max_gap_s, namespace), size))
             queued_bytes += size
         while pending:
-            future, _ = pending.popleft()
-            yield future.result()
+            name, future, _ = pending.popleft()
+            yield name, future.result()
 
 
 class FlightIndex:
@@ -842,7 +850,10 @@ class FlightIndex:
 
         Explicit source coverage is required: cropped or prop-only historical
         data must never become an apparently complete national all-type index.
-        The optional callback reports build phases and observed counts only.
+        The optional callback reports build phases, counts and durable checkpoints.
+        Matching unfinished builds resume automatically. Early ingest resume
+        replays/skips committed source batches; after ingest, frames are unused.
+        Legacy/incompatible partial files are preserved and rejected.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -861,102 +872,176 @@ class FlightIndex:
                                       segments=result.report.get("segments", 0), cached=True)
                 return result
             temporary = path.with_suffix(".building")
-            temporary.unlink(missing_ok=True)
+            # This identity is only for unfinished work. Keep the published
+            # index input hash unchanged for existing cache readers.
+            build_hash = content_hash({"inputs": identity, "prepared": prepared,
+                                       "prepare_scope": prepare_scope,
+                                       "builder": _prepared_track_identity()})
+            existed = temporary.exists()
             db = sqlite3.connect(temporary)
             activity = {"phase": "creating_flight_index"}
             last_progress_report = 0.0
+            last_checkpoint = time.monotonic()
 
             def emit_progress(force=False, **fields):
                 nonlocal last_progress_report
-                if progress_callback is None:
-                    return
+                durable = fields.pop("checkpoint", False)
                 activity.update(fields)
                 now = time.monotonic()
-                if force or now - last_progress_report >= 3.0:
-                    progress_callback(**activity)
+                if progress_callback and (force or now - last_progress_report >= 3.0):
+                    progress_callback(**activity, checkpoint=durable)
                     last_progress_report = now
 
             def sqlite_progress():
                 emit_progress()
                 return 0
 
+            def checkpoint(stage):
+                nonlocal last_checkpoint
+                state["stage"] = stage
+                db.execute("UPDATE build_state SET value=? WHERE id=1",
+                           (json.dumps(state),))
+                db.commit()
+                last_checkpoint = time.monotonic()
+                emit_progress(force=True, phase=stage, checkpoint=True,
+                              rows=state["rows"], batches=state["batches"],
+                              segments=state["segments"], flights=state["flights"],
+                              invalid_rows=state["invalid"])
+
             try:
-                emit_progress(force=True)
+                if existed:
+                    # Never delete/upgrade legacy or incompatible partials.
+                    # Opening SQLite normally also recovers a hot rollback journal.
+                    try:
+                        row = db.execute("SELECT value FROM build_state WHERE id=1").fetchone()
+                        state = json.loads(row[0])
+                    except (sqlite3.DatabaseError, TypeError, json.JSONDecodeError) as error:
+                        raise DataUnavailable(
+                            f"Unrecognized flight index checkpoint; preserve it and use a new path: {temporary}"
+                        ) from error
+                    stages = {"staging_samples", "creating_sample_lookup", "building_segments",
+                              "dropping_samples", "preparing_tracks", "compacting_flight_index",
+                              "publishing_flight_index"}
+                    if (not isinstance(state, dict) or state.get("version") != 1 or state.get("build_hash") != build_hash
+                            or state.get("stage") not in stages):
+                        raise DataUnavailable(
+                            f"Flight index checkpoint has different inputs/builder/configuration: {temporary}")
+                # OFF/OFF made a forced timeout capable of corrupting committed
+                # observations. Use SQLite's crash-recoverable rollback journal.
+                db.execute("PRAGMA journal_mode=DELETE")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute("PRAGMA cache_size=-16384")
+                db.execute("PRAGMA temp_store=FILE")
+                if not existed:
+                    db.executescript("""
+                        BEGIN IMMEDIATE;
+                        CREATE TABLE samples(flight TEXT, time REAL, row TEXT);
+                        CREATE TABLE segments(id INTEGER PRIMARY KEY, name TEXT UNIQUE, start REAL, end REAL,
+                            payload BLOB, payload_hash TEXT);
+                        CREATE VIRTUAL TABLE spatial USING rtree(id, west, east, south, north);
+                        CREATE INDEX time_index ON segments(start,end);
+                        CREATE TABLE metadata(value TEXT);
+                        CREATE TABLE build_state(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT);
+                    """)
+                    state = {"version": 1, "build_hash": build_hash, "stage": "staging_samples",
+                             "rows": 0, "invalid": 0, "altitude": {}, "batches": 0,
+                             "segments": 0, "flights": 0, "last_flight": None}
+                    db.execute("INSERT INTO build_state VALUES(1,?)", (json.dumps(state),))
+                    db.commit()
+                emit_progress(force=True, phase=state["stage"], resumed=existed,
+                              rows=state["rows"], batches=state["batches"],
+                              segments=state["segments"], flights=state["flights"])
                 if progress_callback:
                     db.set_progress_handler(sqlite_progress, 1_000_000)
-                db.executescript("""
-                    PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-16384;
-                    PRAGMA temp_store=FILE;
-                    CREATE TABLE samples(flight TEXT, time REAL, row TEXT);
-                    CREATE TABLE segments(id INTEGER PRIMARY KEY, name TEXT UNIQUE, start REAL, end REAL,
-                        payload BLOB, payload_hash TEXT);
-                    CREATE VIRTUAL TABLE spatial USING rtree(id, west, east, south, north);
-                    CREATE INDEX time_index ON segments(start,end);
-                    CREATE TABLE metadata(value TEXT);
-                """)
-                rows, invalid, altitude = 0, 0, Counter()
-                batches = 0
-                emit_progress(phase="staging_samples", rows=rows, batches=batches,
-                              invalid_rows=invalid, force=True)
-                for frame in frames:
-                    if prepared:
-                        staged, invalid_count, altitude_counts = frame
-                        count = len(staged)
+                if state["stage"] == "staging_samples":
+                    altitude = Counter(state["altitude"])
+                    # Decoding must replay the same source batches after an early
+                    # ingest interruption; committed batches are not inserted twice.
+                    committed_batches = state["batches"]
+                    seen = 0
+                    for seen, frame in enumerate(frames, 1):
+                        if seen <= committed_batches:
+                            continue
+                        if prepared:
+                            staged, invalid_count, altitude_counts = frame
+                            count = len(staged)
+                        else:
+                            clean, invalid_count, altitude_counts = _prepare_staging(frame, class_map)
+                            count, staged = len(clean), _staging_rows(clean)
+                        db.executemany("INSERT INTO samples VALUES(?,?,?)", staged)
+                        state["rows"] += count
+                        state["invalid"] += invalid_count
+                        altitude.update(altitude_counts)
+                        state["altitude"] = dict(altitude)
+                        state["batches"] = seen
+                        if seen % 128 == 0 or time.monotonic() - last_checkpoint >= _INDEX_CHECKPOINT_SECONDS:
+                            checkpoint("staging_samples")
+                        emit_progress(phase="staging_samples", checkpoint=False,
+                                      rows=state["rows"], batches=seen, invalid_rows=state["invalid"])
+                    if seen < committed_batches:
+                        raise DataUnavailable("Resumed flight source ended before its committed batches")
+                    checkpoint("creating_sample_lookup")
+                if state["stage"] == "creating_sample_lookup":
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("CREATE INDEX flight_samples ON samples(flight,time)")
+                    checkpoint("building_segments")
+                if state["stage"] == "building_segments":
+                    namespace = coverage.get("release_tag", "")
+                    workers = _index_workers() if prepared else 1
+                    if workers > 1:
+                        flights = _parallel_flight_segments(
+                            db, max_flight_samples, max_gap_s, namespace, workers, state["last_flight"])
                     else:
-                        clean, invalid_count, altitude_counts = _prepare_staging(frame, class_map)
-                        count, staged = len(clean), _staging_rows(clean)
-                    invalid += invalid_count
-                    altitude.update(altitude_counts)
-                    db.executemany("INSERT INTO samples VALUES(?,?,?)", staged)
-                    rows += count
-                    batches += 1
-                    emit_progress(phase="staging_samples", rows=rows, batches=batches, invalid_rows=invalid)
-                emit_progress(phase="creating_sample_lookup", rows=rows, batches=batches, force=True)
-                db.execute("CREATE INDEX flight_samples ON samples(flight,time)")
-                db.commit()
-                segments = 0
-                flights_processed = 0
-                emit_progress(phase="building_segments", rows=rows, segments=segments,
-                              flights=flights_processed, force=True)
-                namespace = coverage.get("release_tag", "")
-                workers = _index_workers() if prepared else 1
-                if workers > 1:
-                    flights = _parallel_flight_segments(db, max_flight_samples, max_gap_s, namespace, workers)
-                else:
-                    flights = (_build_flight_segments(flight, records, max_gap_s, namespace)
-                               for flight, records in _flight_inputs(db, max_flight_samples))
-                for flight_segments in flights:
-                    flights_processed += 1
-                    for name, start, end, payload, payload_hash, bounds in flight_segments:
-                        cur = db.execute("INSERT INTO segments(name,start,end,payload,payload_hash) VALUES(?,?,?,?,?)",
-                                         (name, start, end, payload, payload_hash))
-                        db.execute("INSERT INTO spatial VALUES(?,?,?,?,?)", (cur.lastrowid, *bounds))
-                        segments += 1
-                    emit_progress(phase="building_segments", rows=rows, segments=segments,
-                                  flights=flights_processed)
-                db.execute("DROP TABLE samples")
-                report = dict(identity, input_hash=content_hash(identity), rows=rows, invalid_rows=invalid,
-                              segments=segments, altitude_basis_counts=dict(altitude),
-                              jets_excluded=coverage.get("aircraft_policy") == "confirmed_nonjet",
-                              unknown_types_retained=coverage.get("aircraft_policy") != "confirmed_nonjet", geometry_clipped=False, continuous_geometry_bounds=True)
-                emit_progress(phase="preparing_tracks", rows=rows, segments=segments, force=True)
-                track_progress = None
-                if progress_callback:
+                        flights = ((flight, _build_flight_segments(flight, records, max_gap_s, namespace))
+                                   for flight, records in _flight_inputs(
+                                       db, max_flight_samples, state["last_flight"]))
+                    for flight, flight_segments in flights:
+                        for name, start, end, payload, payload_hash, bounds in flight_segments:
+                            cur = db.execute("INSERT INTO segments(name,start,end,payload,payload_hash) VALUES(?,?,?,?,?)",
+                                             (name, start, end, payload, payload_hash))
+                            db.execute("INSERT INTO spatial VALUES(?,?,?,?,?)", (cur.lastrowid, *bounds))
+                            state["segments"] += 1
+                        state["flights"] += 1
+                        state["last_flight"] = flight
+                        if state["flights"] % 128 == 0 or time.monotonic() - last_checkpoint >= _INDEX_CHECKPOINT_SECONDS:
+                            checkpoint("building_segments")
+                        emit_progress(phase="building_segments", checkpoint=False,
+                                      segments=state["segments"], flights=state["flights"])
+                    checkpoint("dropping_samples")
+                if state["stage"] == "dropping_samples":
+                    # Commit all segments BEFORE this potentially long operation.
+                    # DROP and its next stage are one recoverable transaction.
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("DROP TABLE samples")
+                    checkpoint("preparing_tracks")
+                if state["stage"] == "preparing_tracks":
+                    report = dict(identity, input_hash=content_hash(identity),
+                                  rows=state["rows"], invalid_rows=state["invalid"],
+                                  segments=state["segments"], altitude_basis_counts=state["altitude"],
+                                  jets_excluded=coverage.get("aircraft_policy") == "confirmed_nonjet",
+                                  unknown_types_retained=coverage.get("aircraft_policy") != "confirmed_nonjet",
+                                  geometry_clipped=False, continuous_geometry_bounds=True)
                     def track_progress(**fields):
                         emit_progress(force=True, **fields)
-                report["prepared_tracks"] = cls._prepare_tracks(
-                    db, prepare_scope, progress_callback=track_progress)
-                db.execute("INSERT INTO metadata VALUES(?)", (json.dumps(report),))
-                db.commit()
-                emit_progress(phase="compacting_flight_index", rows=rows, segments=segments, force=True)
-                db.execute("VACUUM")
+                    # An interrupted optional preparation rolls back and restarts;
+                    # committed observations/segments never need to be rebuilt.
+                    db.execute("BEGIN IMMEDIATE")
+                    report["prepared_tracks"] = cls._prepare_tracks(
+                        db, prepare_scope, progress_callback=track_progress)
+                    db.execute("INSERT INTO metadata VALUES(?)", (json.dumps(report),))
+                    checkpoint("compacting_flight_index")
+                if state["stage"] == "compacting_flight_index":
+                    db.execute("VACUUM")
+                    checkpoint("publishing_flight_index")
+                # Validate metadata before atomically exposing a finished index.
+                cls(temporary)
                 db.close()
-                temporary.replace(path)
-                emit_progress(phase="flight_index_ready", rows=rows, segments=segments, force=True)
+                os.link(temporary, path)  # Refuse to overwrite a concurrent destination.
+                temporary.unlink()
+                emit_progress(phase="flight_index_ready", force=True)
                 return cls(path)
             except BaseException:
-                db.close()
-                temporary.unlink(missing_ok=True)
+                db.close()  # Roll back unfinished work, retain the last durable checkpoint.
                 raise
 
     @classmethod

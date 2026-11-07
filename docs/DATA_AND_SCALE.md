@@ -19,8 +19,46 @@ through the same streaming archive reader. Existing indexes are filtered before 
 New daily archive indexes prepare traces and compute flight-segment geometry in
 separate processes, using the available CPU cores minus one for the SQLite writer
 (and at least one worker). Queued work is bounded and results are written in
-source order. SQLite writes and finalization still run in the writer process; a
-stopped partial index must be rebuilt.
+source order. SQLite writes and finalization still run in the writer process.
+New builds use a SQLite rollback journal with full synchronization and keep a
+transactional `build_state` in the `.building` file. Sample and flight progress
+is committed every 128 batches/flights or after five seconds, at the next item
+boundary. Long individual SQL operations are not five-second checkpoints.
+All segments are committed before dropping samples; optional track preparation
+and compaction have separate durable stages. Progress marks actual commits with
+`checkpoint=true` and reports `dropping_samples` explicitly.
+
+Repeat the same build with the same sources, runtime/builder, staging batch
+sequence and preparation scope to resume. An interrupted ingest must decode and
+skip its committed source batches; after ingest completes the frames iterator is
+not reopened. Completed flights, including those producing no segments, are
+skipped by their committed flight key. Optional preparation and unfinished SQL
+operations can repeat. Rollback/recovery may take time and need disk space;
+dropping a large sample table can require a rollback journal approaching that
+table's size, and VACUUM additionally needs room for another database copy.
+This is crash recovery, not protection from faulty storage or corrupt inputs.
+
+Unrecognized legacy partials and incompatible checkpoints are rejected without
+deletion. Preserve a legacy `.building` and choose a different output path; this
+change cannot resume a file corrupted by the old `journal_mode=OFF` builder.
+Only a completed index is atomically published, without replacing an existing
+destination. Archive downloads remain global per UTC day regardless of receiver
+bounds. `FlightCache(..., offline=True)` reuses cached metadata/archive parts and
+refuses missing downloads. Changing code does not update a separately installed
+package: use the chosen checkout explicitly and keep its normalization and
+aircraft-policy metadata consistent with the search configuration.
+
+The focused crash checks use 134 archived C172/H500 observations (six segments),
+kill the writer at stage boundaries and inside uncommitted writes/VACUUM, then
+compare raw/prepared payloads, spatial bounds and metadata against an uninterrupted
+build. They also exercise parallel resume, SQLite integrity and mismatch refusal:
+
+```bash
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 \
+  python -m unittest discover -s tests -p test_real_index_resume.py -v
+```
+
+These are small software checks, not full-day throughput or location validation.
 
 For a fresh automatic regional upload, only segments touching its receiver bounds
 and emission-time interval get the optional numeric decoding cache. Every eligible confirmed non-jet
