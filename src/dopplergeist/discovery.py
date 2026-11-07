@@ -362,6 +362,45 @@ def discover_events(recording, *, output_dir=None, settings=None, plot_summary=T
     if recording.metadata["sample_rate_hz"] != 4000 or recording.source_path is None:
         raise ValueError("Discovery requires a 4000 Hz intake recording with its original audio source")
 
+    # Opt-in replay of validated baseline detections from the same audio.
+    import os
+    replay_path = os.environ.get("DOPPLERGEIST_BASELINE_JSON")
+    if replay_path:
+        import hashlib
+        from .matching import prepare_events
+        source = Path(replay_path)
+        raw = source.read_bytes()
+        data = json.loads(raw)
+        if data.get("source_sha256") != recording.metadata["source_sha256"]:
+            raise ValueError("Baseline replay belongs to different audio")
+        events = [validate_event(event) for event in data["events"]]
+        prepared, _ = prepare_events(events)
+        if not prepared:
+            raise ValueError("Baseline replay has no matching groups")
+        if output_dir is None:
+            raise ValueError("Baseline replay requires an output directory")
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        if (output / "discovery.json").exists():
+            raise FileExistsError("Discovery output exists")
+        data["replay_provenance"] = {
+            "mode": "experimental_cached_baseline",
+            "path": str(source),
+            "json_sha256": hashlib.sha256(raw).hexdigest(),
+            "note": "Baseline detector replay; advanced detector not used"
+        }
+        (output / "discovery.json").write_text(
+            json.dumps(data, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8")
+        if plot_summary:
+            groups = [[np.asarray(points) for points in group]
+                      for group in data["harmonic_ridges"]]
+            _plot_groups(groups, output / "discovery.png",
+                         recording.metadata["duration_s"], 2.0)
+        if progress_callback:
+            progress_callback(phase="grouping_proposals")
+        return events
+
     def run(output):
         output.mkdir(parents=True, exist_ok=True)
         if (output / "discovery.json").exists():

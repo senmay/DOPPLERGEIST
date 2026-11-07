@@ -315,6 +315,11 @@ does not establish real terrain or altitude-datum accuracy. Its result retains
 that limitation for real recordings.
 Local overrides require prebuilt indexes and retain their actual coverage.
 
+For controlled research using saved acoustic proposals, see
+[experimental baseline replay](LOCAL_BASELINE_REPLAY.md). This opt-in path checks
+audio identity and labels reused detections; it does not validate automatic
+discovery or bypass location acceptance requirements.
+
 `search_budget.max_tiles` limits the initial root-tile prefix. Recursive
 subdivision can create more work than that root limit, so use
 `search_budget.max_tile_evaluations` to cap newly scored coarse tiles in one

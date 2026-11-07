@@ -134,12 +134,16 @@ def analyze(request, output_dir, config=None, progress=lambda *args, **kwargs: N
     if spectral_options is not None and (not isinstance(spectral_options, dict)
                                          or spectral_options.keys() - spectral_keys):
         return finish("failed", "invalid_configuration", "Spectral comparison accepts only work limits and spectral grid settings.")
+    def report_intake_progress(**details):
+        fraction, message = _decode_progress(
+            0.05, 0.14, "Decoding audio", **details)
+        progress("intake", fraction, message=message)
+
     if not resume:
         progress("intake", 0.05, message="Decoding audio.")
         try:
             recording = intake_recording(request["audio_path"], output / "intake", time_window=request.get("time_window"),
-                                         progress_callback=_throttled(lambda **details: progress(
-                                             "intake", *_decode_progress(0.05, 0.14, "Decoding audio", **details))))
+                                         progress_callback=_throttled(report_intake_progress))
         except AudioIntakeError as exc:
             return finish("failed", exc.code, str(exc))
         state["recording"] = recording.metadata
@@ -158,6 +162,11 @@ def analyze(request, output_dir, config=None, progress=lambda *args, **kwargs: N
         _save_audio_checkpoint(output, request, config)
     state["recording"] = recording.metadata
     state["events"] = events
+    discovery_report = json.loads((output / "discovery/discovery.json").read_text())
+    if "replay_provenance" in discovery_report:
+        provenance["event_selection"] = "experimental_cached_baseline"
+        provenance["discovery_replay"] = discovery_report["replay_provenance"]
+        write_json(output / "provenance.json", provenance)
     provenance["discovered_events"] = len({event.get("harmonic_group_id", event["event_id"]) for event in events})
     provenance["discovered_ridges"] = len(events)
     if recording.time_status == "needs_input":
